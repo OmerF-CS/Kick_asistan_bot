@@ -37,8 +37,8 @@ from memory import UserMemory
 #  YAPILANDIRMA
 # ──────────────────────────────────────────────────────────
 
-# .env dosyasını yükle
-load_dotenv()
+# .env dosyasını yükle (Arayüzden güncellenen verilerin anında algılanması için override=True)
+load_dotenv(override=True)
 
 # Ortam değişkenlerini oku
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
@@ -48,6 +48,7 @@ KICK_CLIENT_ID = os.getenv("KICK_CLIENT_ID", "")
 KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "")
 KICK_REDIRECT_URI = os.getenv("KICK_REDIRECT_URI", "http://localhost:3000/callback")
 COOLDOWN_SECONDS = int(os.getenv("BOT_COOLDOWN", "3"))  # Varsayılan 3 saniye bekleme süresi
+AI_RESPONSE_CHANCE = float(os.getenv("AI_RESPONSE_CHANCE", "15")) / 100.0  # Varsayılan %15 katılım
 
 # Botun tepki vereceği tetikleyiciler
 COMMAND_PREFIX = "!"                     # "!bot", "!soru" gibi komutlar
@@ -312,9 +313,9 @@ class KickAsistan:
             if trigger in msg_lower:
                 return True
 
-        # Rastgele aktif katılım (örneğin %15 ihtimalle sohbete dahil olma)
+        # Rastgele aktif katılım (Arayüzden ayarlanan ihtimalle sohbete dahil olma)
         import random
-        if random.random() < 0.15:
+        if random.random() < AI_RESPONSE_CHANCE:
             return True
 
         return False
@@ -663,7 +664,7 @@ class KickAsistan:
             logger.info("Bot başarıyla başlatıldı ve dinlemeye geçti.")
             
             # Başlangıçta komutları duyur
-            startup_msg = "🤖 Bot aktif! Komutlar: !sayıoyunu, !kelimeoyunu, !puan, !liderlik, !öğren [bilgi]. Sohbet için ismimi etiketleyin."
+            startup_msg = "🤖 Asistan Bot sohbete katıldı! 🎉 Komutlar: !sayıoyunu, !kelimeoyunu, !puan, !liderlik. Benimle sohbet etmek için bana seslenmeniz yeterli!"
             await self._send_bot_message(startup_msg)
             
             await self.listener.listen()
