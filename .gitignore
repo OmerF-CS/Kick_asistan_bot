@@ -1,21 +1,29 @@
-# Gizli dosyalar
+# Environments
 .env
-kick_tokens.json
+.env.local
+.env.*.local
 
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-dist/
-build/
+*.py[cod]
+*.class
 venv/
+env/
 .venv/
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
+# Databases
+*.db
+*.sqlite
+*.sqlite3
 
-bot_data.db
+# Logs and Outputs
+*.log
+out.txt
+
+# IDEs
+.idea/
+.vscode/
+
+# Specific to this project
+kick_tokens.json
+

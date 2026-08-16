@@ -14,7 +14,7 @@ import os
 import hashlib
 import base64
 import secrets
-from typing import Callable, Awaitable
+from typing import Callable, Awaitable, Optional, Dict, List, Any
 import websockets
 from curl_cffi import requests as cffi_requests
 
@@ -72,6 +72,7 @@ class KickChatListener:
         self.on_message = on_message_callback
         self.on_subscription = on_subscription_callback
         self.on_follow = on_follow_callback
+        self.on_message_deleted = None
         self._running = False
         self._reconnect_delay = 5   # Saniye cinsinden yeniden bağlanma bekleme süresi
         self._max_reconnect_delay = 60
@@ -236,17 +237,21 @@ class KickChatListener:
             content = msg_data.get("content", "")
             msg_id = msg_data.get("id", "")
             
+            replied_user = None
+            if msg_data.get("type") == "reply" and "metadata" in msg_data:
+                replied_user = msg_data["metadata"].get("original_sender", {}).get("username")
+            
             if user_id:
-                self.user_id_cache[username] = int(user_id)
+                self.user_id_cache[username.lower()] = int(user_id)
             
             # Moderatör kontrolü
             badges = msg_data.get("sender", {}).get("identity", {}).get("badges", [])
             is_mod = any(b.get("type") in ["moderator", "broadcaster", "staff"] for b in badges)
 
-            logger.info(f"💬 [{'MOD ' if is_mod else ''}{username}]: {content}")
+            logger.info(f"💬 [{'MOD ' if is_mod else ''}{username}]: {content}" + (f" (Yanıt: @{replied_user})" if replied_user else ""))
 
             if self.on_message:
-                await self.on_message(username, content, msg_id, is_mod)
+                await self.on_message(username, content, msg_id, is_mod, replied_user)
 
         elif event == "pusher:pong":
             logger.debug("💓 Pong alındı")
@@ -276,7 +281,14 @@ class KickChatListener:
                 logger.error(f"Takip eventi ayrıştırılamadı: {e}")
 
         elif event == "App\\Events\\ChatMessageDeletedEvent":
-            logger.debug("🗑️ Bir mesaj silindi")
+            try:
+                del_data = json.loads(data.get("data", "{}"))
+                msg_id = del_data.get("message", {}).get("id") or del_data.get("id")
+                logger.debug(f"🗑️ Bir mesaj silindi (ID: {msg_id})")
+                if self.on_message_deleted and msg_id:
+                    await self.on_message_deleted(msg_id)
+            except Exception as e:
+                logger.error(f"Mesaj silme eventi ayrıştırılamadı: {e}")
 
         elif event.startswith("pusher"):
             logger.debug(f"📡 Pusher olayı: {event}")
@@ -299,7 +311,7 @@ class KickChatListener:
         """Daha önce kaydedilmiş OAuth tokenlarını yükler."""
         if os.path.exists(self._token_file):
             try:
-                with open(self._token_file, "r") as f:
+                with open(self._token_file, "r", encoding="utf-8-sig") as f:
                     tokens = json.load(f)
                 self.access_token = tokens.get("access_token")
                 self.refresh_token = tokens.get("refresh_token")
@@ -313,7 +325,7 @@ class KickChatListener:
     def _save_tokens(self):
         """OAuth tokenlarını dosyaya kaydeder."""
         try:
-            with open(self._token_file, "w") as f:
+            with open(self._token_file, "w", encoding="utf-8-sig") as f:
                 json.dump(
                     {
                         "access_token": self.access_token,
@@ -395,6 +407,10 @@ class KickChatListener:
                 "Authorization": f"Bearer {self.access_token}",
                 "Content-Type": "application/json",
             }
+            if not self.broadcaster_user_id:
+                logger.error("❌ Yayıncı ID'si henüz alınmadığı için mesaj gönderilemiyor.")
+                return False
+
             payload = {
                 "broadcaster_user_id": int(self.broadcaster_user_id),
                 "content": message,
@@ -425,19 +441,42 @@ class KickChatListener:
             logger.error(f"❌ Mesaj gönderme hatası: {e}")
             return False
 
+    async def _get_user_id(self, username: str) -> Optional[int]:
+        """Kullanıcı adından ID'sini bulur (Önbellek destekli)."""
+        username_lower = username.lstrip("@").lower()
+        if username_lower in self.user_id_cache:
+            return self.user_id_cache[username_lower]
+            
+        try:
+            url = f"{self.KICK_CHANNEL_API}/{username_lower}"
+            resp = await asyncio.to_thread(cffi_requests.get, url, impersonate="chrome")
+            if resp.status_code == 200:
+                data = resp.json()
+                user_id = data.get("user_id") or data.get("user", {}).get("id")
+                if user_id:
+                    self.user_id_cache[username_lower] = int(user_id)
+                    return int(user_id)
+        except Exception as e:
+            logger.error(f"❌ {username} için ID alınamadı: {e}")
+        return None
+
     async def ban_user(self, banned_username: str, duration_minutes: int = 0, reason: str = "", _retry: bool = False) -> bool:
         """
-        Kullanıcıyı kanaldan banlar veya timeout atar (Kick Public API üzerinden).
-        duration_minutes = 0 ise kalıcı ban, 0'dan büyükse timeout atılır.
+        Kullanıcıyı kanaldan resmi Kick Moderasyon API'si ile banlar veya timeout atar.
         """
-        user_id = self.user_id_cache.get(banned_username)
-        if not user_id:
-            logger.error(f"❌ '{banned_username}' için user_id bulunamadı (Önbellekte yok). İşlem yapılamıyor.")
+        banned_user_id = await self._get_user_id(banned_username)
+        if not banned_user_id:
+            logger.error(f"❌ {banned_username} ID'si bulunamadığı için ban atılamadı.")
             return False
-            
+
         if not self.broadcaster_user_id:
-            logger.error("❌ broadcaster_user_id bilinmiyor. Ban atılamıyor.")
+            logger.error("❌ Yayıncı ID'si bilinmiyor, ban atılamadı.")
             return False
+
+        # Token kontrolü
+        if time.time() >= self.token_expiry:
+            if not self._refresh_access_token():
+                return False
 
         try:
             url = "https://api.kick.com/public/v1/moderation/bans"
@@ -449,35 +488,90 @@ class KickChatListener:
             
             payload = {
                 "broadcaster_user_id": int(self.broadcaster_user_id),
-                "user_id": int(user_id),
-                "reason": reason
+                "user_id": banned_user_id,
+                "reason": reason if reason else "Moderator action via bot"
             }
             
             if duration_minutes > 0:
                 payload["duration"] = duration_minutes
-
+                
             resp = await asyncio.to_thread(
                 cffi_requests.post,
                 url,
                 headers=headers,
                 json=payload,
-                impersonate="chrome",
+                impersonate="chrome"
             )
-
-            if resp.status_code in (200, 201, 204):
-                action = "Banlandı" if duration_minutes == 0 else f"{duration_minutes} dk Susturuldu"
-                logger.info(f"🔨 [Mod İşlemi] {banned_username} -> {action} ({reason})")
+            
+            if resp.status_code in (200, 201):
+                action = f"{duration_minutes} dk Susturuldu" if duration_minutes > 0 else "Kalıcı Banlandı"
+                logger.info(f"🔨 [Mod İşlemi Resmi API] {banned_username} -> {action}")
                 return True
-            elif resp.status_code in (401, 403):
-                logger.warning(f"⚠️ Moderasyon yetkisi reddedildi (HTTP {resp.status_code}). Token eksik yetkiye (moderation:ban) sahip olabilir.")
+            elif resp.status_code == 401:
                 if not _retry and self._refresh_access_token():
                     return await self.ban_user(banned_username, duration_minutes, reason, _retry=True)
+                logger.error(f"❌ Ban yetkisi reddedildi (401). OAuth'da 'moderation:ban' izni var mı? — {resp.text}")
                 return False
             else:
-                logger.error(f"❌ Ban/Timeout işlemi başarısız: HTTP {resp.status_code} — {resp.text}")
+                logger.error(f"❌ Ban isteği başarısız: HTTP {resp.status_code} — {resp.text}")
                 return False
+
         except Exception as e:
-            logger.error(f"❌ Ban/Timeout hatası: {e}")
+            logger.error(f"❌ Ban gönderme hatası: {e}")
+            return False
+
+    async def unban_user(self, banned_username: str, _retry: bool = False) -> bool:
+        """
+        Kullanıcının banını veya timeout'unu resmi Kick Moderasyon API'si ile kaldırır.
+        """
+        banned_user_id = await self._get_user_id(banned_username)
+        if not banned_user_id:
+            logger.error(f"❌ {banned_username} ID'si bulunamadığı için ban açılamadı.")
+            return False
+
+        if not self.broadcaster_user_id:
+            logger.error("❌ Yayıncı ID'si bilinmiyor, ban açılamadı.")
+            return False
+
+        if time.time() >= self.token_expiry:
+            if not self._refresh_access_token():
+                return False
+
+        try:
+            url = "https://api.kick.com/public/v1/moderation/bans"
+            headers = {
+                "Authorization": f"Bearer {self.access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            
+            payload = {
+                "broadcaster_user_id": int(self.broadcaster_user_id),
+                "user_id": banned_user_id
+            }
+            
+            resp = await asyncio.to_thread(
+                cffi_requests.delete,
+                url,
+                headers=headers,
+                json=payload,
+                impersonate="chrome"
+            )
+            
+            if resp.status_code in (200, 201):
+                logger.info(f"🔓 [Mod İşlemi Resmi API] {banned_username} -> Banı Açıldı")
+                return True
+            elif resp.status_code == 401:
+                if not _retry and self._refresh_access_token():
+                    return await self.unban_user(banned_username, _retry=True)
+                logger.error(f"❌ Ban açma yetkisi reddedildi (401).")
+                return False
+            else:
+                logger.error(f"❌ Ban açma isteği başarısız: HTTP {resp.status_code} — {resp.text}")
+                return False
+
+        except Exception as e:
+            logger.error(f"❌ Ban açma hatası: {e}")
             return False
 
     # ══════════════════════════════════════════════════
@@ -524,7 +618,7 @@ class KickChatListener:
             f"?client_id={self.client_id}"
             f"&redirect_uri={self.redirect_uri}"
             f"&response_type=code"
-            f"&scope=chat:write+chat:read+channel:read"
+            f"&scope=user:read+chat:write+chat:read+channel:read+channel:manage:bans+channel:manage:timeouts+moderation:ban"
             f"&code_challenge={code_challenge}"
             f"&code_challenge_method=S256"
             f"&state={state}"

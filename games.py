@@ -19,7 +19,7 @@ class GameEngine:
 
     def _load_word_pool(self) -> list:
         if os.path.exists(self.word_pool_file):
-            with open(self.word_pool_file, "r", encoding="utf-8") as f:
+            with open(self.word_pool_file, "r", encoding="utf-8-sig") as f:
                 try:
                     return json.load(f)
                 except Exception:
@@ -38,7 +38,7 @@ class GameEngine:
             {"word": "japonya", "desc": "Doğu Asya'da bulunan, 'Doğan Güneşin Ülkesi' olarak bilinen ada ülkesi."},
             {"word": "orkide", "desc": "Zarif ve egzotik çiçekleriyle bilinen, bakımı özel ilgi isteyen bir süs bitkisi."}
         ]
-        with open(self.word_pool_file, "w", encoding="utf-8") as f:
+        with open(self.word_pool_file, "w", encoding="utf-8-sig") as f:
             json.dump(default_pool, f, ensure_ascii=False, indent=2)
         return default_pool
 
@@ -93,15 +93,36 @@ class GameEngine:
 
     # --- Kelime Oyunu ---
     
-    def start_word_game(self) -> str | None:
+    async def start_word_game(self, brain=None) -> str | None:
         if self.current_game is not None:
             return "Şu an zaten devam eden bir oyun var!"
             
-        self.current_game = "word"
-        self.game_start_time = time.time()
+        self.current_game = "starting"
         
-        word_obj = random.choice(self.word_pool)
-        word = word_obj["word"].lower()
+        word_obj = None
+        pool_size = len(self.word_pool)
+        
+        # Dinamik AI Kelime Üretimi (Scaling Probability)
+        if brain:
+            prob = max(0.0, 1.0 - (pool_size / 1000.0))
+            if random.random() < prob:
+                current_words = [w["word"] for w in self.word_pool]
+                new_word = await brain.generate_trivia_word(current_words)
+                if new_word:
+                    word_obj = new_word
+                    self.word_pool.append(new_word)
+                    # Dosyaya kaydet
+                    try:
+                        with open(self.word_pool_file, "w", encoding="utf-8-sig") as f:
+                            json.dump(self.word_pool, f, ensure_ascii=False, indent=2)
+                        logger.info(f"Yepyeni bir kelime öğrenildi: {new_word['word']}")
+                    except Exception as e:
+                        logger.error(f"Kelime havuzu kaydedilemedi: {e}")
+        
+        if not word_obj:
+            word_obj = random.choice(self.word_pool)
+            
+        word = word_obj["word"].replace("I", "ı").replace("İ", "i").lower()
         desc = word_obj["desc"]
         
         self.game_data = {
@@ -110,6 +131,8 @@ class GameEngine:
             "duration": 30,  # 30 saniye
             "hint_given": False
         }
+        self.game_start_time = time.time()
+        self.current_game = "word"
         logger.info(f"Kelime oyunu başladı. Hedef: {word}")
         return f"🔤 Kelime Oyunu Başladı! (Süre: 30 sn)\n❓ Anlamı: {desc}\n(10 saniye sonra ipucu gelecek)"
 
@@ -133,7 +156,7 @@ class GameEngine:
             return f"💡 İpucu: Kelime {len(word)} harfli ve '{hint}' şeklinde."
 
         # Tahmin kontrolü
-        guess = guess_str.strip().lower()
+        guess = guess_str.strip().replace("I", "ı").replace("İ", "i").lower()
         if guess == self.game_data["word"]:
             self.add_score(username, 10)
             self.current_game = None

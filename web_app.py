@@ -20,7 +20,7 @@ def read_env():
     """Reads the .env file and returns a dictionary of settings."""
     settings = {}
     if os.path.exists(ENV_FILE_PATH):
-        with open(ENV_FILE_PATH, "r", encoding="utf-8") as f:
+        with open(ENV_FILE_PATH, "r", encoding="utf-8-sig") as f:
             for line in f:
                 line = line.strip()
                 if line and not line.startswith("#"):
@@ -34,10 +34,10 @@ def write_env(settings):
     # First, read existing lines to preserve comments and order
     existing_lines = []
     if os.path.exists(ENV_FILE_PATH):
-        with open(ENV_FILE_PATH, "r", encoding="utf-8") as f:
+        with open(ENV_FILE_PATH, "r", encoding="utf-8-sig") as f:
             existing_lines = f.readlines()
             
-    with open(ENV_FILE_PATH, "w", encoding="utf-8") as f:
+    with open(ENV_FILE_PATH, "w", encoding="utf-8-sig") as f:
         written_keys = set()
         for line in existing_lines:
             stripped = line.strip()

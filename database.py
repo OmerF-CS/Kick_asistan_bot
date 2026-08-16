@@ -25,9 +25,16 @@ class Database:
                     mod BOOLEAN DEFAULT 0,
                     last_injected REAL DEFAULT 0,
                     favori_konular TEXT DEFAULT '[]',
-                    son_mesajlar TEXT DEFAULT '[]'
+                    son_mesajlar TEXT DEFAULT '[]',
+                    role TEXT DEFAULT 'viewer'
                 )
             """)
+            
+            # Migration for existing databases
+            try:
+                self.conn.execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'viewer'")
+            except sqlite3.OperationalError:
+                pass # Column already exists
             
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_active_days (
@@ -62,6 +69,17 @@ class Database:
                 )
             """)
 
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS mod_logs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT,
+                    action TEXT,
+                    duration INTEGER,
+                    reason TEXT,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
     # --- Users & Memory ---
     
     def get_user(self, username: str) -> Optional[Dict[str, Any]]:
@@ -81,8 +99,8 @@ class Database:
     def upsert_user(self, username: str, user_data: dict):
         with self.conn:
             self.conn.execute("""
-                INSERT INTO users (username, ilk_gorulen, son_gorulen, toplam_mesaj, oyun_puani, mod, last_injected, favori_konular, son_mesajlar)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO users (username, ilk_gorulen, son_gorulen, toplam_mesaj, oyun_puani, mod, last_injected, favori_konular, son_mesajlar, role)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(username) DO UPDATE SET
                     ilk_gorulen=excluded.ilk_gorulen,
                     son_gorulen=excluded.son_gorulen,
@@ -91,7 +109,8 @@ class Database:
                     mod=excluded.mod,
                     last_injected=excluded.last_injected,
                     favori_konular=excluded.favori_konular,
-                    son_mesajlar=excluded.son_mesajlar
+                    son_mesajlar=excluded.son_mesajlar,
+                    role=excluded.role
             """, (
                 username,
                 user_data.get('ilk_gorulen', ''),
@@ -101,7 +120,8 @@ class Database:
                 1 if user_data.get('mod', False) else 0,
                 user_data.get('last_injected', 0.0),
                 json.dumps(user_data.get('favori_konular', [])),
-                json.dumps(user_data.get('son_mesajlar', []))
+                json.dumps(user_data.get('son_mesajlar', [])),
+                user_data.get('role', 'viewer')
             ))
 
             if 'aktif_gunler' in user_data:
@@ -114,6 +134,22 @@ class Database:
         for row in cursor.fetchall():
             users[row['username']] = self.get_user(row['username'])
         return users
+
+    def get_vip_og_candidates(self) -> List[Dict[str, Any]]:
+        """
+        Kullanıcıları aktif gün sayısı ve oyun puanına göre sıralayarak döndürür.
+        VIP ve OG atamaları için kullanılır.
+        """
+        all_users = self.get_all_users().values()
+        
+        def calculate_score(user):
+            active_days = len(user.get('aktif_gunler', []))
+            points = user.get('oyun_puani', 0)
+            # Aktif gün daha ağırlıklı: 1 aktif gün = 10 puan değerinde
+            return (active_days * 10) + points
+
+        sorted_users = sorted(all_users, key=calculate_score, reverse=True)
+        return sorted_users
 
     def add_active_day(self, username: str, date: str):
         with self.conn:
@@ -149,6 +185,10 @@ class Database:
         with self.conn:
             self.conn.execute("INSERT OR REPLACE INTO static_commands (command, response) VALUES (?, ?)", (command, response))
 
+    def delete_static_command(self, command: str):
+        with self.conn:
+            self.conn.execute("DELETE FROM static_commands WHERE command = ?", (command,))
+
     # --- Pending Commands ---
     def get_pending_commands(self) -> Dict[str, dict]:
         cursor = self.conn.execute("SELECT command, response, users FROM pending_commands")
@@ -183,3 +223,29 @@ class Database:
     def clear_chat_history(self):
         with self.conn:
             self.conn.execute("DELETE FROM chat_history")
+    # --- Moderation Logs ---
+
+    def add_mod_log(self, username: str, action: str, duration: int, reason: str):
+        """Kullanıcının yediği cezayı veritabanına ekler."""
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO mod_logs (username, action, duration, reason) VALUES (?, ?, ?, ?)",
+                (username.lower(), action, duration, reason)
+            )
+
+    def get_mod_logs(self, username: str) -> list:
+        """Kullanıcının aldığı son 3 cezayı getirir."""
+        cursor = self.conn.execute(
+            "SELECT action, duration, reason, timestamp FROM mod_logs WHERE username = ? ORDER BY timestamp DESC LIMIT 3",
+            (username.lower(),)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def get_total_infractions(self, username: str) -> int:
+        """Kullanıcının yediği toplam ceza sayısını getirir."""
+        cursor = self.conn.execute(
+            "SELECT COUNT(*) FROM mod_logs WHERE username = ?",
+            (username.lower(),)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else 0

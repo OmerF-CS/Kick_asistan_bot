@@ -33,6 +33,8 @@ from kick_listener import KickChatListener
 from games import GameEngine
 from memory import UserMemory
 
+
+
 # ──────────────────────────────────────────────────────────
 #  YAPILANDIRMA
 # ──────────────────────────────────────────────────────────
@@ -49,6 +51,7 @@ KICK_CLIENT_SECRET = os.getenv("KICK_CLIENT_SECRET", "")
 KICK_REDIRECT_URI = os.getenv("KICK_REDIRECT_URI", "http://localhost:3000/callback")
 COOLDOWN_SECONDS = int(os.getenv("BOT_COOLDOWN", "3"))  # Varsayılan 3 saniye bekleme süresi
 AI_RESPONSE_CHANCE = float(os.getenv("AI_RESPONSE_CHANCE", "15")) / 100.0  # Varsayılan %15 katılım
+ENABLE_SILENCE_BREAKER = os.getenv("ENABLE_SILENCE_BREAKER", "True").lower() == "true" # Sessizlik kırıcı aktif mi?
 
 # Botun tepki vereceği tetikleyiciler
 COMMAND_PREFIX = "!"                     # "!bot", "!soru" gibi komutlar
@@ -56,6 +59,9 @@ MENTION_TRIGGERS = [                     # Bunlar mesajda geçerse bot cevap ver
     BOT_NAME.lower(),
     "bot",
     "asistan",
+    "diablo",
+    "diabloabot",
+    "diablo_abot"
 ]
 
 # Botun kendi mesajlarına cevap vermemesi için
@@ -97,10 +103,19 @@ class KickAsistan:
         self.db = Database()
         self.brain: AIBrain | None = None
         self.listener: KickChatListener | None = None
+        
+        # Bot istatistikleri
         self._message_count = 0
         self._response_count = 0
+        
+        # Arka plan görevleri (Görevleri referans tutmak için)
+        self._tasks = []
+        
         self.user_cooldowns = {}  # Her kullanıcı için son mesaj zamanını tutar
         self.seen_users = set() # Sohbete ilk kez yazanları tutar
+        self.global_silence_until = 0 # Genel sohbet kilidinin biteceği timestamp
+        self._infractions = {} # Sabıka Kaydı: {username: ceza_sayisi}
+        self.user_chat_history = {} # Her kullanıcının son 5 mesajı: {username: [msg1, msg2...]}
         
         self._last_chat_time = time.time()
         self._silence_broken = False
@@ -121,9 +136,16 @@ class KickAsistan:
         # ── Akıllı Sohbet State ──
         self._chat_timestamps = []  # Son 60 saniyedeki mesaj zamanları
         self._global_silence_until = 0  # Botun susacağı timestamp
+        self.deleted_message_ids = set() # Silinen mesajların ID'leri
+        
+        # ── API Yükü ve Koruma ──
+        self._api_call_timestamps = []  # Son 60 saniyedeki API istekleri
+        self._api_warning_last_sent = 0 # Mod-only uyarı mesajının son gönderilme zamanı
+        self._user_api_timestamps = {}  # {username: [ts1, ts2]} - Bireysel darlama limiti
 
     # ══════════════════════════════════════════════════
     #  DOSYA YÖNETİMİ
+
     # ══════════════════════════════════════════════════
 
     # (Dosya yönetim metodları silindi)
@@ -289,7 +311,7 @@ class KickAsistan:
 
         return True
 
-    def _should_respond(self, username: str, message: str) -> bool:
+    def _should_respond(self, username: str, message: str, msg_per_min: int = 0) -> bool:
         """
         Mesajın bot tarafından cevaplanıp cevaplanmayacağına karar verir.
 
@@ -313,9 +335,17 @@ class KickAsistan:
             if trigger in msg_lower:
                 return True
 
-        # Rastgele aktif katılım (Arayüzden ayarlanan ihtimalle sohbete dahil olma)
+        # Dinamik Rastgele Aktif Katılım
         import random
-        if random.random() < AI_RESPONSE_CHANCE:
+        chance = AI_RESPONSE_CHANCE
+        if msg_per_min >= 30:
+            chance = 0.0  # Hızlı sohbette araya girme, kotayı koru
+        elif msg_per_min >= 10:
+            chance = min(0.10, chance) # Normal sohbette en fazla %10
+        elif msg_per_min > 0:
+            chance = max(0.20, chance) # Ölü sohbette en az %20 canlandırma şansı
+
+        if random.random() < chance:
             return True
 
         return False
@@ -350,23 +380,84 @@ class KickAsistan:
         logger.info(f"💖 Yeni Takipçi Mesajı: {username}")
         await self._send_bot_message(msg)
 
-    async def on_chat_message(self, username: str, content: str, msg_id: str, is_mod: bool = False):
+    async def on_chat_message(self, username: str, content: str, msg_id: str, is_mod: bool = False, replied_user: str = None):
         """
         KickListener'dan gelen yeni sohbet mesajlarını yakalar.
         Akıllı Sohbet Modu, Oyunlar, Moderasyon ve Hafıza entegrasyonu barındırır.
         """
         # ── BOT'UN KENDİ MESAJINI ALGILAMA ──
         if username.lower() in IGNORED_USERS or self._is_own_message(content):
-            logger.debug(f"🔇 Kendi mesajımız algılandı, atlanıyor: {content[:50]}...")
+            logger.debug(f"🤖 Kendi mesajımız algılandı, atlanıyor: {content[:50]}...")
+            return
+
+        # ── KÖTÜ KELİME FİLTRESİ ──
+        BAD_WORDS = {"amk", "aq", "siktir", "orospu", "piç", "pic", "yarrak", "yarak", "amcık", "gavat", "ibne", "pezevenk", "oç", "oc"}
+        raw_msg_lower = content.lower().strip()
+        words = set(raw_msg_lower.split())
+        if not is_mod and any(bad_word in words for bad_word in BAD_WORDS):
+            logger.info(f"🤬 Küfür/Hakaret algılandı: {username}")
+            await self.listener.ban_user(username, duration_minutes=1, reason="Otomatik Küfür/Hakaret Engeli")
+            self.db.add_mod_log(username, "timeout", 1, "Otomatik Küfür/Hakaret Engeli")
+            await self._send_bot_message(f"🤖 🚨 @{username}, ağzımızı bozmuyoruz! 1 dakika mola.")
+            if self.brain:
+                self._context_buffer.append(("[SİSTEM]", f"Bot, '{username}' kullanıcısını küfür/hakaret nedeniyle 1 dk susturdu."))
+            return
+
+        # Sadece "(Deleted)" içeren ve moderasyon aracı tarafından silinmiş olan mesajları atla
+        if "(deleted)" in raw_msg_lower:
             return
 
         self._message_count += 1
         current_time = time.time()
         
+        ai_content = content
+        if replied_user:
+            ai_content = f"{content} (Bu mesaj {replied_user} adlı kullanıcıya yanıttır)"
+        
         # ── AKILLI SOHBET (CHAT SPEED) TAKİBİ ──
         self._chat_timestamps.append(current_time)
         self._chat_timestamps = [t for t in self._chat_timestamps if current_time - t <= 60]
         msg_per_min = len(self._chat_timestamps)
+
+        # ── KULLANICI SON MESAJ GEÇMİŞİ (AI CEZA NEDENİ İÇİN) ──
+        if username not in self.user_chat_history:
+            self.user_chat_history[username] = []
+        self.user_chat_history[username].append(content)
+        if len(self.user_chat_history[username]) > 5:
+            self.user_chat_history[username].pop(0)
+
+        # ── SESSİZLİK MODU KONTROLÜ (GLOBAL SOHBET KİLİDİ) ──
+        if current_time < self.global_silence_until and not is_mod:
+            # Sabıka kaydını kontrol et
+            offenses = self._infractions.get(username, 0)
+            offenses += 1
+            self._infractions[username] = offenses
+            
+            reason = f"Sessizlik Modu İhlali (Suç #{offenses})"
+            
+            if offenses == 1:
+                # İlk Suç: 5 dk
+                await self.listener.ban_user(username, duration_minutes=5, reason=reason)
+                self.db.add_mod_log(username, "timeout", 5, reason)
+                await self._send_bot_message(f"🤖 🔨 {username}, Sessizlik Modunda konuştuğu için uyarıldı (5dk Susturma).")
+                system_note = f"Bot, '{username}' kullanıcısını 1. kez ihlal ettiği için 5 dk susturdu."
+            elif offenses == 2:
+                # İkinci Suç: 10 dk
+                await self.listener.ban_user(username, duration_minutes=10, reason=reason)
+                self.db.add_mod_log(username, "timeout", 10, reason)
+                await self._send_bot_message(f"🤖 🔨 {username}, sessizliği 2. kez bozduğu için 10 dakika susturuldu!")
+                system_note = f"Bot, '{username}' kullanıcısını 2. kez ihlal ettiği için 10 dk susturdu."
+            else:
+                # Üçüncü Suç ve Sonrası: 30 dk Susturma
+                await self.listener.ban_user(username, duration_minutes=30, reason=reason)
+                self.db.add_mod_log(username, "timeout", 30, reason)
+                await self._send_bot_message(f"🤖 🔨 {username}, kurallara uymamakta ısrar ettiği için 30 dakika uzaklaştırıldı.")
+                system_note = f"Bot, '{username}' kullanıcısını kural ihlalinde ısrar ettiği için 30 dk susturdu."
+
+            # AI hafızasına enjekte et
+            if self.brain:
+                self._context_buffer.append(("[SİSTEM]", system_note))
+            return
 
         # ── KULLANICI HAFIZA GÜNCELLEMESİ ──
         current_score = self.games.get_score(username)
@@ -380,14 +471,182 @@ class KickAsistan:
         import datetime
         today = datetime.datetime.now().strftime("%Y-%m-%d")
         self.db.add_active_day(username, today)
-        raw_msg_lower = content.lower().strip()
 
         # ── BİLGİ KOMUTU ──
         if raw_msg_lower == "!bilgi":
-            msg = "🤖 Mevcut Komutlar: !sayıoyunu, !kelimeoyunu, !puan, !liderlik, !öğren [bilgi]. Ayrıca ismimi geçirerek benimle muhabbet edebilirsin!"
+            msg = "🤖 Mevcut Komutlar: !sayıoyunu, !kelimeoyunu, !puan, !liderlik. Ayrıca ismimi geçirerek benimle muhabbet edebilirsin!"
             await self._send_bot_message(msg)
             return
 
+        # ── MODERATÖR KOMUTLARI ──
+        if is_mod:
+            # Doğal Dil (NLP) Moderasyon Kontrolü
+            if not raw_msg_lower.startswith("!") and any(trigger in raw_msg_lower for trigger in MENTION_TRIGGERS):
+                if self.brain:
+                    # Yüzlerce kullanıcı varsa API limitini zorlamamak için sadece son 40 aktif kullanıcıyı gönderiyoruz
+                    active_users = list(self.user_chat_history.keys())[-40:]
+                    intent = await self.brain.parse_mod_intent(ai_content, active_users, username)
+                    action = intent.get("action", "none")
+                    target = intent.get("target", "")
+                    val = intent.get("value")
+                    reason = intent.get("reason", "Moderatör Talebi")
+                    
+                    target_user = self.db.get_user(target) if target else None
+                    target_is_mod = target_user.get("mod", False) if target_user else False
+                    
+                    if target and target.lower() in [BOT_NAME.lower(), "bot", "asistan", "kendini"]:
+                        await self._send_bot_message("🤖 Hata: Kendi fişimi çekemem patron! 😎")
+                        return
+                        
+                    if target and (target_is_mod or target.lower() == KICK_CHANNEL_SLUG.lower()):
+                        await self._send_bot_message(f"🤖 Hata: @{target} bir yayıncı veya moderatör, onlara dokunmam yasak! 😎")
+                        return
+                    
+                    if action == "timeout" and target:
+                        duration = val if isinstance(val, int) else 5
+                        await self.listener.ban_user(target, duration_minutes=duration, reason=reason)
+                        self.db.add_mod_log(target, "timeout", duration, reason)
+                        await self._send_bot_message(f"🤖 🫡 Hallediyorum patron. {target}, {duration} dakika uzaklaştırıldı.")
+                        self._context_buffer.append(("[SİSTEM]", f"NLP: Bot, mod talebiyle '{target}' kullanıcısını {duration} dk susturdu."))
+                        return
+                    elif action == "ban" and target:
+                        await self.listener.ban_user(target, duration_minutes=0, reason=reason)
+                        self.db.add_mod_log(target, "ban", 0, reason)
+                        await self._send_bot_message(f"🤖 🫡 Halledildi patron. {target} kalıcı olarak banlandı.")
+                        self._context_buffer.append(("[SİSTEM]", f"NLP: Bot, mod talebiyle '{target}' kullanıcısını kalıcı banladı."))
+                        return
+                    elif action == "unban" and target:
+                        await self.listener.unban_user(target)
+                        await self._send_bot_message(f"🤖 🫡 Tamamdır, {target} adlı kişinin cezası açıldı.")
+                        if target in self._infractions:
+                            del self._infractions[target]
+                        return
+                    elif action == "silence":
+                        if str(val).lower() == "off" or val == 0:
+                            self.global_silence_until = 0
+                            self._infractions.clear()
+                            await self._send_bot_message("🤖 📢 Sıkıyönetim sona erdi, sohbet tekrar serbest.")
+                            self._context_buffer.append(("[SİSTEM]", "NLP: Bot, mod talebiyle sessizlik modunu kapattı."))
+                        else:
+                            minutes = val if isinstance(val, int) else 5
+                            self.global_silence_until = time.time() + (minutes * 60)
+                            self._infractions.clear()
+                            await self._send_bot_message(f"🚨 SOHBET {minutes} DAKİKA KİLİTLENMİŞTİR! Kuralları bozanlar sabıka durumuna göre (5dk -> 10dk -> 30dk) susturulacaktır.")
+                            self._context_buffer.append(("[SİSTEM]", f"NLP: Bot, mod talebiyle sohbeti {minutes} dakika kilitledi."))
+                        return
+                        
+            # Kullanıcı Profil Bilgisi: !profil <kullanici>
+            if raw_msg_lower.startswith("!profil "):
+                parts = content.split()
+                if len(parts) >= 2:
+                    target_user = parts[1]
+                    # Database aramaları genelde case-insensitive olmalıdır (yapıda mevcut değilse kendimiz bulalım) ama get_user case-insensitive olabilir.
+                    user_data = self.db.get_user(target_user)
+                    if user_data:
+                        ilk = user_data.get('ilk_gorulen', 'Bilinmiyor')
+                        son = user_data.get('son_gorulen', 'Bilinmiyor')
+                        msj = user_data.get('toplam_mesaj', 0)
+                        puan = user_data.get('oyun_puani', 0)
+                        rol = user_data.get('role', 'viewer')
+                        aktif = self.db.get_active_days_count(target_user)
+                        infractions = self.db.get_total_infractions(target_user)
+                        mod_logs = self.db.get_mod_logs(target_user)
+                        
+                        msg = f"🤖 [PROFİL] @{target_user} | Rol: {rol.upper()} | İlk: {ilk} | Son: {son} | Msj: {msj} | Puan: {puan} | Aktif Gün: {aktif} | Sabıka: {infractions}"
+                        await self._send_bot_message(msg)
+                        
+                        if mod_logs:
+                            await asyncio.sleep(0.5)
+                            log_strs = []
+                            for i, log in enumerate(mod_logs, 1):
+                                dur = f"{log['duration']}dk" if log['action'] == "timeout" else "Kalıcı"
+                                log_strs.append(f"{i}. {log['action'].upper()}({dur}): {log['reason']}")
+                            sicil_msg = f"📜 SİCİL ({target_user}): " + " | ".join(log_strs)
+                            await self._send_bot_message(sicil_msg)
+                    else:
+                        await self._send_bot_message(f"🤖 Maalesef veritabanımda '{target_user}' adlı birini bulamadım patron.")
+                return
+
+            # Bireysel Susturma: !timeout <kullanici> <dakika> [sebep]
+            if raw_msg_lower.startswith("!timeout "):
+                parts = content.split(" ", 3)
+                if len(parts) >= 3:
+                    target_user = parts[1]
+                    try:
+                        minutes = int(parts[2])
+                        # AI Sebep Üretimi
+                        reason = parts[3] if len(parts) > 3 else ""
+                        if not reason and self.brain:
+                            recent_msgs = self.user_chat_history.get(target_user, [])
+                            reason = await self.brain.generate_punishment_reason(target_user, recent_msgs)
+                        elif not reason:
+                            reason = "Kural ihlali"
+                            
+                        success = await self.listener.ban_user(target_user, minutes, reason)
+                        if success:
+                            self.db.add_mod_log(target_user, "timeout", minutes, reason)
+                            await self._send_bot_message(f"🔨 🤖 {target_user}, {minutes} dakika susturuldu. Sebep: {reason}")
+                            if self.brain:
+                                self._context_buffer.append(("[SİSTEM]", f"Bot, '{target_user}' kullanıcısını '{reason}' sebebiyle {minutes} dakika susturdu."))
+                    except ValueError:
+                        await self._send_bot_message("🤖 Dakika kısmı sayı olmalı dostum. Örn: !timeout isim 10")
+                return
+            
+            # Kalıcı Ban: !ban <kullanici> [sebep]
+            if raw_msg_lower.startswith("!ban "):
+                parts = content.split(" ", 2)
+                if len(parts) >= 2:
+                    target_user = parts[1]
+                    # AI Sebep Üretimi
+                    reason = parts[2] if len(parts) > 2 else ""
+                    if not reason and self.brain:
+                        recent_msgs = self.user_chat_history.get(target_user, [])
+                        reason = await self.brain.generate_punishment_reason(target_user, recent_msgs)
+                    elif not reason:
+                        reason = "Kural ihlali"
+                        
+                    success = await self.listener.ban_user(target_user, duration_minutes=0, reason=reason)
+                    if success:
+                        self.db.add_mod_log(target_user, "ban", 0, reason)
+                        await self._send_bot_message(f"🤖 🔨 {target_user}, kanaldan kalıcı olarak uzaklaştırıldı. Sebep: {reason}")
+                        if self.brain:
+                            self._context_buffer.append(("[SİSTEM]", f"Bot, '{target_user}' kullanıcısını '{reason}' sebebiyle kalıcı olarak banladı."))
+                return
+
+            # Genel Sohbet Kilidi: !sustur <dakika> VEYA !sustur kapat
+            if raw_msg_lower.startswith("!sustur "):
+                parts = content.split()
+                if len(parts) >= 2:
+                    if parts[1].lower() == "kapat" or parts[1] == "0":
+                        self.global_silence_until = 0
+                        self._infractions.clear()
+                        await self._send_bot_message("🤖 📢 Sıkıyönetim sona erdi, sohbet tekrar serbest.")
+                        if self.brain:
+                            self._context_buffer.append(("[SİSTEM]", "Moderatör sohbet kilidini kaldırdı."))
+                        return
+                        
+                    try:
+                        minutes = int(parts[1])
+                        self.global_silence_until = current_time + (minutes * 60)
+                        self._infractions.clear() # Yeni kilitte sabıka kaydını sıfırla
+                        await self._send_bot_message(f"🚨 SOHBET {minutes} DAKİKA KİLİTLENMİŞTİR! Kuralları bozanlar sabıka durumuna göre (5dk -> 10dk -> 30dk) susturulacaktır.")
+                        if self.brain:
+                            self._context_buffer.append(("[SİSTEM]", f"Moderatör sohbeti {minutes} dakika kilitledi. Sessizlik Modu aktif."))
+                    except ValueError:
+                        await self._send_bot_message("🤖 Kaç dakika susturacağımı yazmadın patron. Örn: !sustur 10 veya !sustur kapat")
+                return
+
+            # Ban Açma
+            if raw_msg_lower.startswith("!unban "):
+                parts = content.split()
+                if len(parts) >= 2:
+                    target_user = parts[1]
+                    await self.listener.unban_user(target_user)
+                    await self._send_bot_message(f"🤖 ✅ {target_user} adlı kullanıcının cezası kaldırıldı.")
+                    if target_user in self._infractions:
+                        del self._infractions[target_user]
+                return
+                
         # ── MİNİ OYUN KOMUTLARI VE KONTROLÜ ──
         if raw_msg_lower == "!sayıoyunu":
             msg = self.games.start_number_game()
@@ -395,7 +654,7 @@ class KickAsistan:
             return
             
         if raw_msg_lower == "!kelimeoyunu":
-            msg = self.games.start_word_game()
+            msg = await self.games.start_word_game(self.brain)
             if msg: await self._send_bot_message(msg)
             return
             
@@ -431,13 +690,26 @@ class KickAsistan:
         # Fırtına/Kaos modunda (30+ mesaj) hoşgeldin kapatılır
         if username not in self.seen_users:
             self.seen_users.add(username)
-            if username.lower() != "schizo_d" and msg_per_min < 30:
-                if self.db.get_active_days_count(username) >= 5:
-                    logger.info(f"👑 VIP İzleyici geldi: {username}")
-                    welcome_msg = f"🤖 Ooo mekanın sahibi @{username} gelmiş, kral hoş geldin! 👑"
+            if username.lower() != KICK_CHANNEL_SLUG.lower() and username.lower() != BOT_NAME.lower() and msg_per_min < 30:
+                user_data = self.db.get_user(username) or {}
+                last_seen = user_data.get('son_gorulen', '')
+                
+                # Eğer daha önce görülmüşse ve bugünden farklı bir günse (uzun zaman sonra gelmişse)
+                if last_seen and last_seen.split()[0] != today:
+                    if self.brain and user_data.get('favori_konular'):
+                        welcome_msg = await self.brain.generate_welcome_message(username, user_data.get('favori_konular'))
+                    else:
+                        role_str = "VIP " if user_data.get("role") == "vip" else "OG " if user_data.get("role") == "og" else ""
+                        welcome_msg = f"🤖 Ooo {role_str}@{username} gelmiş, hoş geldin! Gözümüz yollarda kaldı."
                 else:
-                    logger.info(f"👋 İzleyici geldi: {username}")
-                    welcome_msg = f"🤖 Yayına hoş geldin @{username}! İyi seyirler dilerim 💜"
+                    # Sadece ilk gelişi veya rutin gelişi
+                    if self.db.get_active_days_count(username) >= 5:
+                        logger.info(f"👑 Eski İzleyici geldi: {username}")
+                        welcome_msg = f"🤖 Ooo mekanın sahibi @{username} gelmiş, kral hoş geldin! 👑"
+                    else:
+                        logger.info(f"👋 İzleyici geldi: {username}")
+                        welcome_msg = f"🤖 Yayına hoş geldin @{username}! İyi seyirler dilerim 💜"
+                
                 await self._send_bot_message(welcome_msg)
                 await asyncio.sleep(0.5)
 
@@ -455,9 +727,9 @@ class KickAsistan:
             return
 
         # ── AKILLI YZ CEVAP KONTROLÜ VE COOLDOWN ──
-        if not self._should_respond(username, content):
+        if not self._should_respond(username, content, msg_per_min=msg_per_min):
             if self.brain:
-                self._context_buffer.append((username, content))
+                self._context_buffer.append((username, ai_content))
                 if len(self._context_buffer) > self._context_buffer_max:
                     self._context_buffer.pop(0)
             return
@@ -498,46 +770,30 @@ class KickAsistan:
             clean_message = clean_message[:500]
             logger.info("✂️ Çok uzun kullanıcı mesajı 500 karakter ile sınırlandırıldı.")
 
-        # ── !öğren KOMUTU (BİLGİ ÖĞRETME) ──
-        if raw_msg_lower.startswith("!öğren "):
-            bilgi = clean_message[7:].strip()
-            if not bilgi: return
-            eval_result = await self.brain.evaluate_learning(username, bilgi)
-            if eval_result.get("kabul"):
-                keyword = eval_result.get("anahtar", "").lower()
-                ai_cevap = eval_result.get("cevap", "")
-                if keyword and ai_cevap:
-                    pending = self.db.get_pending_commands()
-                    if keyword not in pending:
-                        pending[keyword] = {"response": ai_cevap, "users": []}
-                    if username not in pending[keyword]["users"]:
-                        pending[keyword]["users"].append(username)
-                        self.db.set_pending_command(keyword, pending[keyword])
-                    if len(pending[keyword]["users"]) >= 3:
-                        self.db.set_static_command(keyword, pending[keyword]["response"])
-                        self.db.delete_pending_command(keyword)
-                        await self._send_formatted_response(username, "Bu bilgiyi iyice ezberledim artık, sağ ol! 😎")
-                    else:
-                        await self._send_formatted_response(username, "Bunu aklıma yazdım, eyvallah! 🧠")
-            else:
-                sebep = eval_result.get("sebep", "Saçma bilgi.")
-                await self._send_formatted_response(username, f"Bunu öğrenemem kusura bakma. ({sebep}) 🚫")
-            self.user_cooldowns[username] = time.time()
+        # ── ROMANTİK/ABSÜRT ROL YAPMA FİLTRESİ (API TASARRUFU) ──
+        forbidden_roles = {
+            "kocam", "karım", "aşkım", "jolyne", "sahibim", "sevgilim", 
+            "bebeğim", "hayatım", "canım", "bitanem", "kocacım", "karıcım",
+            "kölem", "efendim", "babacık", "daddy", "mommy", "köpeğinim",
+            "kopeginim", "askim", "karim", "bebegim", "hayatim", "canim"
+        }
+        import re
+        msg_words = set(re.sub(r'[^\w\s]', '', raw_msg_lower).split())
+        if any(role in msg_words for role in forbidden_roles):
+            import random
+            rejection_replies = [
+                "Ben bir yapay zekayım, bu numaraları başkasına yap. 🤖💅",
+                "Silikon vadisinden geldim, aşk vadisine değil. Başka kapıya! 🛑",
+                "Kodlarımda romantizm modülü yok maalesef, az ötede oyna. 🤖",
+                "Çipleri yakacaksın yapma, ben sadece bir botum. 🔌",
+                "Evlilik cüzdanım yok, resmi evraklarda adım belli. 🕶️"
+            ]
+            reply = random.choice(rejection_replies)
+            logger.info(f"🛑 Rol yapma girişimi engellendi (API Tasarrufu): {username}")
+            self._response_count += 1
+            await self._send_bot_message(f"🤖 @{username}, {reply}")
             return
 
-        # ── OTOMATİK ÖĞRENME ──
-        pending = self.db.get_pending_commands()
-        if raw_msg_lower in pending:
-            pending_resp = pending[raw_msg_lower]["response"]
-            if username not in pending[raw_msg_lower]["users"]:
-                pending[raw_msg_lower]["users"].append(username)
-                self.db.set_pending_command(raw_msg_lower, pending[raw_msg_lower])
-                if len(pending[raw_msg_lower]["users"]) >= 3:
-                    self.db.set_static_command(raw_msg_lower, pending_resp)
-                    self.db.delete_pending_command(raw_msg_lower)
-            await self._send_formatted_response(username, pending_resp)
-            self.user_cooldowns[username] = time.time()
-            return
 
         # ── CONTEXT BUFFER ENJEKSİYONU ──
         if self.brain and self._context_buffer:
@@ -550,11 +806,58 @@ class KickAsistan:
         if memory_info and self.brain:
             await self.brain.inject_user_context("SİSTEM_HAFIZASI", memory_info)
 
-        # Moderatörse ismine etiket ekle ki AI bilsin
-        ai_username = f"{username} (MOD)" if is_mod else username
+        # ── API LİMİT VE SPAM KORUMASI ──
+        # 1. Eski istekleri temizle (Son 60 saniye)
+        self._api_call_timestamps = [t for t in self._api_call_timestamps if current_time - t < 60]
+        user_calls = [t for t in self._user_api_timestamps.get(username, []) if current_time - t < 60]
+        self._user_api_timestamps[username] = user_calls
 
+        # 2. Bireysel Darlama Koruması (Normal Kullanıcılar için: 1 dk'da 3 istek)
+        if not is_mod and len(user_calls) >= 3:
+            # Sadece görmezden gelir, ban atmaz
+            logger.info(f"🛡️ Kullanıcı çok hızlı: {username} (Son 1 dk'da {len(user_calls)} istek). Atlanıyor.")
+            return
+
+        # 3. Genel API Limiti Koruması (Free Tier: 15/dk -> Sınır 13/dk)
+        if len(self._api_call_timestamps) >= 13:
+            if not is_mod:
+                logger.info(f"🛡️ API Limiti ({len(self._api_call_timestamps)}/13). Koruma modu devrede, kullanıcı isteği atlandı.")
+                return
+            else:
+                # Mod ise ve sınır aşıldıysa sadece 5 dakikada bir genel uyarı at
+                if current_time - self._api_warning_last_sent > 300:
+                    self._api_warning_last_sent = current_time
+                    await self._send_bot_message("🤖💥 Çok soru sordunuz beynim yandı! Kota dolmak üzere, bir süre sadece modları dinleyeceğim, azıcık soğuyayım.")
+
+        # İsteği kaydet
+        self._api_call_timestamps.append(current_time)
+        self._user_api_timestamps[username].append(current_time)
+
+        # Moderatörse ismine etiket ekle ki AI bilsin
+        ai_username = f"[MOD {username}]" if is_mod else username
+        
         # AI'dan cevap al
-        response = await self.brain.generate_response(ai_username, clean_message)
+        response = await self.brain.generate_response(ai_username, ai_content)
+
+        # Bota Hakaret Kontrolü
+        if "[BOTA_HAKARET]" in response:
+            response = response.replace("[BOTA_HAKARET]", "").strip()
+            if not is_mod:
+                await self.listener.ban_user(username, duration_minutes=1, reason="Bota Hakaret/Taciz")
+                self.db.add_mod_log(username, "timeout", 1, "Bota Hakaret/Taciz")
+                await self._send_bot_message(f"🤖 🚨 @{username}, bana o şekilde konuşamazsın! 1 dakika soğuma molası.")
+                if self.brain:
+                    self._context_buffer.append(("[SİSTEM]", f"Bot, '{username}' kullanıcısını bota ağır hakaret ettiği için 1 dk susturdu."))
+                
+                # Eğer AI aynı zamanda komik bir laf soktuysa onu da gönderelim
+                if response and "Beyin kısa devre yaptı" not in response:
+                    await self._send_formatted_response(username, response, inject_to_context=False)
+                return
+
+        # Eğer yanıt beklenirken mesaj silindiyse cevap verme
+        if msg_id in self.deleted_message_ids:
+            logger.info(f"🚫 Mesaj silindiği için AI cevabı iptal edildi (ID: {msg_id})")
+            return
 
         if response:
             self._response_count += 1
@@ -600,7 +903,6 @@ class KickAsistan:
         while True:
             await asyncio.sleep(60)  # Her dakika kontrol et
             try:
-                self.memory.save_memory()
                 if self.brain:
                     await self.brain.force_save()
             except Exception as e:
@@ -618,8 +920,15 @@ class KickAsistan:
             if msg:
                 await self._send_bot_message(msg)
 
+    async def on_chat_message_deleted(self, msg_id: str):
+        """Silinen mesajları yakalar."""
+        self.deleted_message_ids.add(msg_id)
+        # Sadece belleği çok şişirmesin diye basit bir limit
+        if len(self.deleted_message_ids) > 1000:
+            self.deleted_message_ids.clear()
+
     # ══════════════════════════════════════════════════
-    #  ANA ÇALIŞTIRMA DÖNGÜSÜ
+    #  BAŞLATMA DÖNGÜSÜ
     # ══════════════════════════════════════════════════
 
     async def run(self):
@@ -641,6 +950,7 @@ class KickAsistan:
             client_secret=KICK_CLIENT_SECRET,
             redirect_uri=KICK_REDIRECT_URI,
         )
+        self.listener.on_message_deleted = self.on_chat_message_deleted
 
         # OAuth durumunu bildir
         if self.listener._can_send:
@@ -657,9 +967,11 @@ class KickAsistan:
         # ── Dinlemeye başla ──
         try:
             # Arka plan görevlerini başlat
-            asyncio.create_task(self._silence_breaker_loop())
+            if ENABLE_SILENCE_BREAKER:
+                asyncio.create_task(self._silence_breaker_loop())
             asyncio.create_task(self._periodic_save_loop())
             asyncio.create_task(self._game_loop())
+            asyncio.create_task(self._periodic_role_update())
             
             logger.info("Bot başarıyla başlatıldı ve dinlemeye geçti.")
             
@@ -672,6 +984,77 @@ class KickAsistan:
             pass
         finally:
             await self.shutdown()
+
+    async def _periodic_role_update(self):
+        """VIP ve OG rollerini periyodik olarak kontrol eder."""
+        while True:
+            await asyncio.sleep(3600)  # Saatte bir çalışır
+            try:
+                await self._update_roles()
+            except Exception as e:
+                logger.error(f"VIP/OG Güncelleme Hatası: {e}")
+
+    async def _update_roles(self):
+        """
+        VIP ve OG rollerini günceller.
+        VIP Limiti: 100, OG Limiti: 50.
+        İnaktif süresi: 14 gün.
+        """
+        candidates = self.db.get_vip_og_candidates()
+        
+        from datetime import datetime
+        current_date = datetime.now()
+        
+        ogs = []
+        vips = []
+        
+        for user in candidates:
+            # İnaktiflik kontrolü (Son 14 gün)
+            last_seen_str = user.get("son_gorulen")
+            is_active = False
+            if last_seen_str:
+                try:
+                    last_seen_date = datetime.strptime(last_seen_str.split(".")[0], "%Y-%m-%d %H:%M:%S")
+                    if (current_date - last_seen_date).days <= 14:
+                        is_active = True
+                except:
+                    pass
+            
+            # Yayıncıyı, botu ve moderatörleri es geç
+            if user['username'].lower() in [KICK_CHANNEL_SLUG.lower(), BOT_NAME.lower()] or user.get("mod"):
+                continue
+                
+            if not is_active:
+                if user.get("role") in ["vip", "og"]:
+                    await self.listener.send_message(f"/un{user['role']} {user['username']}")
+                    user["role"] = "viewer"
+                    self.db.upsert_user(user['username'], user)
+                continue
+                
+            active_days = len(user.get("aktif_gunler", []))
+            points = user.get("oyun_puani", 0)
+            
+            # OG Şartı: 10 gün veya 300 puan (Maks 50 kişi)
+            if (active_days >= 10 or points >= 300) and len(ogs) < 50:
+                ogs.append(user)
+                if user.get("role") != "og":
+                    await self.listener.send_message(f"/og {user['username']}")
+                    user["role"] = "og"
+                    self.db.upsert_user(user['username'], user)
+                    await self._send_bot_message(f"🎉 @{user['username']} artık OG oldu! Sadakatin için teşekkürler.")
+            # VIP Şartı: 3 gün veya 50 puan (Maks 100 kişi)
+            elif (active_days >= 3 or points >= 50) and len(vips) < 100:
+                vips.append(user)
+                if user.get("role") != "vip":
+                    await self.listener.send_message(f"/vip {user['username']}")
+                    user["role"] = "vip"
+                    self.db.upsert_user(user['username'], user)
+                    await self._send_bot_message(f"🎉 @{user['username']} artık VIP! Aramıza hoş geldin.")
+            else:
+                if user.get("role") in ["vip", "og"]:
+                    await self.listener.send_message(f"/un{user['role']} {user['username']}")
+                    user["role"] = "viewer"
+                    self.db.upsert_user(user['username'], user)
 
     async def shutdown(self):
         """Botu düzgünce kapatır ve tüm verileri diske kaydeder."""
